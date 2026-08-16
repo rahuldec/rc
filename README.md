@@ -65,17 +65,31 @@ doc.save("report-fixed.pdf")
 
 ### As a web page (upload PDF → download fixed PDF)
 
+Runs locally — nothing leaves your Mac, nothing is written to disk, logged,
+or retained beyond the current job.
+
+```bash
+./run.sh
+# opens http://127.0.0.1:5050 in your browser automatically
+```
+
+or manually:
+
 ```bash
 source venv/bin/activate
 python app.py
 # open http://127.0.0.1:5050
 ```
 
-Runs entirely in memory — nothing is written to disk, logged, or retained.
 Processing happens in a background thread with a live progress bar (page
 scan progress, then table-merge progress) instead of a blank spinner, since a
-large batch file can take a few seconds. See [DEPLOY.md](DEPLOY.md) for
-putting this on a real URL.
+large batch file can take a few seconds.
+
+Runs great locally; hosting it somewhere so *other people* can reach it over
+the internet turned out to be more trouble than it's worth for solo use —
+free-tier hosts are memory-constrained enough that a large batch file could
+get killed mid-job, and your own Mac has far more headroom. See
+[DEPLOY.md](DEPLOY.md) if you want to revisit that later anyway.
 
 ### Batch processing many files at once
 
