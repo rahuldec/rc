@@ -456,12 +456,35 @@ def _stack_pages(doc: "fitz.Document", page_indices: list):
     return canvas, y, left, right
 
 
+def _looks_like_real_table_header(t: TableGroup) -> bool:
+    """A genuine table header in this template is a short static label
+    ("Sports Club", "Achievements:") — never a full sentence. On a
+    compaction canvas, duplicated border-line geometry can fool
+    find_table_groups into treating a stray row (its label glued to its
+    own body text, e.g. "Basic Dance holds an in-depth understanding of
+    dance techniques...") as its own tiny table. That reads like a
+    run-on sentence rather than a label: long, and containing sentence
+    punctuation. Trusting it as a real table boundary is what let a
+    compaction cut land inside the middle of a real table."""
+    header = t.header_text.strip()
+    return len(header) <= 60 and "." not in header
+
+
 def _safe_cut_points(page: "fitz.Page", top: float, bottom: float) -> list:
     """Y-coordinates between `top` and `bottom` where it's safe to cut this
     page's content without slicing through a table row or a line of text —
     the whitespace gaps between tables and between standalone lines. Always
     includes `top` and `bottom` themselves as valid (empty) cut points."""
-    unsafe = [(t.top, t.bottom) for t in find_table_groups(page)]
+    unsafe = []
+    for t in find_table_groups(page):
+        if not _looks_like_real_table_header(t) and unsafe:
+            # Doesn't look like a real table of its own — almost certainly a
+            # stray fragment of the table right before it. Extend that zone
+            # instead of trusting the gap in front of this one as safe.
+            prev0, prev1 = unsafe[-1]
+            unsafe[-1] = (prev0, max(prev1, t.bottom))
+        else:
+            unsafe.append((t.top, t.bottom))
 
     for b in page.get_text("dict")["blocks"]:
         if "lines" not in b:
@@ -562,6 +585,8 @@ def _compact_student_pages(
     for k in range(n_target_pages):
         doc.new_page(insert_at + k, width=page_w, height=page_h)
     for k, (y0, y1) in enumerate(slices):
+        if y1 <= y0:
+            continue  # all content fit in earlier pages — leave this one blank
         target_page = doc[insert_at + k]
         target_h = (y1 - y0) * scale
         target_page.show_pdf_page(
