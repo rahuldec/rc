@@ -22,16 +22,32 @@ BORDER_MAX_HEIGHT = 2.5
 BORDER_MIN_WIDTH = 15
 Y_BUCKET = 1.0
 SAME_LINE_TOLERANCE = 2.5  # merge border segments this close together into one line
+MAX_ROW_GAP = 70  # boundaries farther apart than this are never the same table's row,
+                   # even with unrelated unbordered text (headings, signatures) between
+                   # them — the tallest legitimate wrapped row seen is ~60pt
 
 
 @dataclass
 class TableGroup:
-    top: float
-    header_bottom: float
-    bottom: float
+    boundaries: list  # row-boundary y-coordinates, ascending; len == n_rows + 1
+    row_texts: list  # text per row band, top to bottom; len == n_rows
     left: float
     right: float
-    header_text: str
+
+    @property
+    def top(self) -> float:
+        return self.boundaries[0]
+
+    @property
+    def bottom(self) -> float:
+        return self.boundaries[-1]
+
+    @property
+    def header_text(self) -> str:
+        """First row's text — a quick single-row signature, mainly for logging.
+        Actual split detection compares row-by-row (see _matching_header_rows)
+        since a table's header isn't always exactly one row."""
+        return self.row_texts[0] if self.row_texts else ""
 
 
 @dataclass
@@ -40,6 +56,7 @@ class SplitCandidate:
     page_i1: int
     table_last: TableGroup
     table_first: TableGroup
+    header_rows: int  # how many leading rows are the shared, unmoving header
 
 
 @dataclass
@@ -70,11 +87,16 @@ def find_table_groups(page: "fitz.Page") -> list:
 
     Row heights inside a table vary a lot here (a wrapped 3-line description
     row can be taller than the whitespace between two separate tables), so a
-    fixed y-gap threshold can't tell "next row" from "next table" apart. What
-    does distinguish them: the gap between two boundaries that belong to the
-    same table is filled with that row's text; the gap between one table's
-    closing border and the next table's opening border is blank. So a new
-    table starts wherever a boundary-to-boundary gap has no text in it.
+    fixed y-gap threshold alone can't tell "next row" from "next table" apart.
+    What mostly distinguishes them: the gap between two boundaries that belong
+    to the same table is filled with that row's text; the gap between one
+    table's closing border and the next table's opening border is blank. So a
+    new table starts wherever a boundary-to-boundary gap has no text in it —
+    *unless* the gap is unusually large (past MAX_ROW_GAP), in which case it's
+    treated as a new table regardless of text in between. That catches
+    unrelated, unbordered text sitting between two separate tables (e.g. a
+    "Congratulations!" line and signature blanks between an achievements box
+    and a reference table below it) that would otherwise glue them together.
     """
     raw_lines = _horizontal_border_ys(page)
     if len(raw_lines) < 2:
@@ -104,7 +126,8 @@ def find_table_groups(page: "fitz.Page") -> list:
 
     groups = [[lines[0]]]
     for prev, cur in zip(lines, lines[1:]):
-        if has_text_between(prev[0], cur[0]):
+        gap = cur[0] - prev[0]
+        if gap <= MAX_ROW_GAP and has_text_between(prev[0], cur[0]):
             groups[-1].append(cur)
         else:
             groups.append([cur])
@@ -113,17 +136,17 @@ def find_table_groups(page: "fitz.Page") -> list:
     for g in groups:
         if len(g) < 2:
             continue  # need at least a top + one row boundary
-        top = g[0][0]
-        header_bottom = g[1][0]
-        bottom = g[-1][0]
+        boundaries = [y for y, _, _ in g]
         left = min(x0 for _, x0, _ in g)
         right = max(x1 for _, _, x1 in g)
-        header_spans = [
-            s for s in spans if top - 0.5 <= (s["bbox"][1] + s["bbox"][3]) / 2 < header_bottom
-        ]
-        header_spans.sort(key=lambda s: s["bbox"][0])
-        header_text = " ".join(s["text"].strip() for s in header_spans)
-        tables.append(TableGroup(top, header_bottom, bottom, left, right, header_text))
+        row_texts = []
+        for row_top, row_bottom in zip(boundaries, boundaries[1:]):
+            row_spans = [
+                s for s in spans if row_top - 0.5 <= (s["bbox"][1] + s["bbox"][3]) / 2 < row_bottom
+            ]
+            row_spans.sort(key=lambda s: (round(s["bbox"][1]), s["bbox"][0]))
+            row_texts.append(" ".join(s["text"].strip() for s in row_spans))
+        tables.append(TableGroup(boundaries, row_texts, left, right))
     return tables
 
 
@@ -137,6 +160,19 @@ def _content_bottom(page: "fitz.Page", below_y: float) -> float:
         if dr["rect"].y0 >= below_y - 1:
             bottom = max(bottom, dr["rect"].y1)
     return bottom
+
+
+def _matching_header_rows(t_last: TableGroup, t_first: TableGroup) -> int:
+    """How many leading rows have identical text on both fragments — that's
+    the shared, unmoving header. A table's header isn't always one row (e.g.
+    a title row plus a subtitle row before the real data starts), so this
+    walks row by row from the top instead of assuming a fixed count."""
+    count = 0
+    for a, b in zip(t_last.row_texts, t_first.row_texts):
+        if not a or a != b:
+            break
+        count += 1
+    return count
 
 
 def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
@@ -155,7 +191,8 @@ def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
             continue
         t_last = tables_i[-1]
         t_first = tables_i1[0]
-        if not t_last.header_text or t_last.header_text != t_first.header_text:
+        header_rows = _matching_header_rows(t_last, t_first)
+        if header_rows == 0:
             continue
         if abs(t_last.left - t_first.left) > 5 or abs(t_last.right - t_first.right) > 5:
             continue
@@ -163,7 +200,7 @@ def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
         page_bottom_content = _content_bottom(doc[i], t_last.bottom)
         if page_bottom_content - t_last.bottom > 20:
             continue
-        candidates.append(SplitCandidate(i, i + 1, t_last, t_first))
+        candidates.append(SplitCandidate(i, i + 1, t_last, t_first, header_rows))
     return candidates
 
 
@@ -188,6 +225,12 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     t_last = split.table_last
     t_first = split.table_first
 
+    # bottom of the last shared header row (there can be more than one, e.g. a
+    # title row plus a subtitle row) — computed separately per page since the
+    # two copies' row heights can differ by a hair even when the text matches.
+    header_bottom_i = t_last.boundaries[split.header_rows]
+    header_bottom_i1 = t_first.boundaries[split.header_rows]
+
     left = min(t_last.left, t_first.left) - 1
     right = max(t_last.right, t_first.right) + 1
 
@@ -197,12 +240,12 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     snap_i1 = _snapshot_page(doc, split.page_i1)
 
     # Fragment A: the rows on page i that need to move up onto page i+1
-    frag_a_rect = fitz.Rect(t_last.left, t_last.header_bottom, t_last.right, t_last.bottom)
+    frag_a_rect = fitz.Rect(t_last.left, header_bottom_i, t_last.right, t_last.bottom)
     frag_a_height = frag_a_rect.height
 
     # Fragment B: everything on page i+1 currently below its own header (old body rows + rest of page)
-    content_bottom = _content_bottom(page_i1, t_first.header_bottom)
-    frag_b_rect = fitz.Rect(t_first.left, t_first.header_bottom, t_first.right, content_bottom + 2)
+    content_bottom = _content_bottom(page_i1, header_bottom_i1)
+    frag_b_rect = fitz.Rect(t_first.left, header_bottom_i1, t_first.right, content_bottom + 2)
     frag_b_height = frag_b_rect.height
 
     # Clear the moved region on page i (leaves the rest of that page untouched)
@@ -210,10 +253,10 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     page_i.apply_redactions()
 
     # Clear everything below page i+1's header (we're about to reinsert it, shifted)
-    page_i1.add_redact_annot(fitz.Rect(left, t_first.header_bottom - 1, right, frag_b_rect.y1 + 1), fill=(1, 1, 1))
+    page_i1.add_redact_annot(fitz.Rect(left, header_bottom_i1 - 1, right, frag_b_rect.y1 + 1), fill=(1, 1, 1))
     page_i1.apply_redactions()
 
-    new_a_top = t_first.header_bottom
+    new_a_top = header_bottom_i1
     new_a_bottom = new_a_top + frag_a_height
     page_i1.show_pdf_page(
         fitz.Rect(t_last.left, new_a_top, t_last.right, new_a_bottom), snap_i, 0, clip=frag_a_rect
