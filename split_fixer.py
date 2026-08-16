@@ -139,9 +139,15 @@ def _content_bottom(page: "fitz.Page", below_y: float) -> float:
     return bottom
 
 
-def detect_splits(doc: "fitz.Document") -> list:
+def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
+    """progress_callback(pages_scanned, total_pages), called once per page."""
     candidates = []
-    page_tables = [find_table_groups(doc[i]) for i in range(doc.page_count)]
+    n = doc.page_count
+    page_tables = []
+    for i in range(n):
+        page_tables.append(find_table_groups(doc[i]))
+        if progress_callback:
+            progress_callback(i + 1, n)
     for i in range(doc.page_count - 1):
         tables_i = page_tables[i]
         tables_i1 = page_tables[i + 1]
@@ -228,23 +234,48 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     return "fixed"
 
 
-def fix_document(doc: "fitz.Document", max_passes: int = 200) -> FixResult:
+def fix_document(doc: "fitz.Document", max_passes: int = 10, progress_callback=None) -> FixResult:
+    """Detect and fix every split table in the document.
+
+    progress_callback(phase, current, total), if given, is called repeatedly:
+    phase='scan' while reading pages to find splits, phase='fix' as each one
+    is merged. A full re-scan only happens once per pass (not once per fix) —
+    within a pass, splits are applied in one sweep and any split whose page
+    was already touched earlier in the same pass is deferred to the next
+    pass, where a fresh scan reflects its current state. In practice nearly
+    every document resolves in a single pass; extra passes only matter for
+    the rare case of a table split across three or more consecutive pages.
+    """
     result = FixResult()
-    for _ in range(max_passes):
-        splits = detect_splits(doc)
+    total_hint = 0
+    for pass_num in range(max_passes):
+        def scan_progress(cur, tot):
+            if progress_callback:
+                progress_callback("scan", cur, tot)
+
+        splits = detect_splits(doc, progress_callback=scan_progress)
         if not splits:
             break
-        # Fix the first one, then re-detect from scratch since page content shifted.
-        split = splits[0]
-        status = fix_split(doc, split)
-        result.splits_fixed += 1
-        result.details.append(
-            {
-                "pages": [split.page_i + 1, split.page_i1 + 1],
-                "header": split.table_last.header_text,
-                "status": status,
-            }
-        )
-        if status == "overflow_risk":
-            result.overflow_risk_pages.append(split.page_i1 + 1)
+        if pass_num == 0:
+            total_hint = len(splits)
+
+        touched_pages = set()
+        for split in splits:
+            if split.page_i in touched_pages or split.page_i1 in touched_pages:
+                continue  # this page changed earlier in this pass; re-detect fresh next pass
+            status = fix_split(doc, split)
+            touched_pages.add(split.page_i)
+            touched_pages.add(split.page_i1)
+            result.splits_fixed += 1
+            result.details.append(
+                {
+                    "pages": [split.page_i + 1, split.page_i1 + 1],
+                    "header": split.table_last.header_text,
+                    "status": status,
+                }
+            )
+            if status == "overflow_risk":
+                result.overflow_risk_pages.append(split.page_i1 + 1)
+            if progress_callback:
+                progress_callback("fix", result.splits_fixed, max(total_hint, result.splits_fixed))
     return result

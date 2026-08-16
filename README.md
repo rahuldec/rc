@@ -72,8 +72,10 @@ python app.py
 ```
 
 Runs entirely in memory — nothing is written to disk, logged, or retained.
-See [DEPLOY.md](DEPLOY.md) for putting this on a real URL others can use
-(includes a password gate, since these are student report cards).
+Processing happens in a background thread with a live progress bar (page
+scan progress, then table-merge progress) instead of a blank spinner, since a
+large batch file can take a few seconds. See [DEPLOY.md](DEPLOY.md) for
+putting this on a real URL.
 
 ### Batch processing many files at once
 
