@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 *.pdf
+build/
+dist/
+*.spec
+.pytest_cache/
