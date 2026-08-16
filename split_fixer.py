@@ -22,9 +22,11 @@ BORDER_MAX_HEIGHT = 2.5
 BORDER_MIN_WIDTH = 15
 Y_BUCKET = 1.0
 SAME_LINE_TOLERANCE = 2.5  # merge border segments this close together into one line
-MAX_ROW_GAP = 70  # boundaries farther apart than this are never the same table's row,
-                   # even with unrelated unbordered text (headings, signatures) between
-                   # them — the tallest legitimate wrapped row seen is ~60pt
+MAX_LINE_GAP = 28  # within a real row, consecutive text lines run ~17-18pt apart;
+                    # a bigger gap means separate standalone lines (e.g. a
+                    # "Congratulations!" heading and a "Grade Incharge" signature
+                    # line), not one wrapped paragraph — even a long achievements
+                    # paragraph stays dense at ~18pt, however tall it gets overall
 
 
 @dataclass
@@ -56,7 +58,16 @@ class SplitCandidate:
     page_i1: int
     table_last: TableGroup
     table_first: TableGroup
-    header_rows: int  # how many leading rows are the shared, unmoving header
+    # Usually the same shared header repeats on both fragments, so these are
+    # equal (see _matching_header_rows). But a lone label with no body at all
+    # (e.g. "Achievements:" with nothing after it) isn't repeated on the next
+    # page — the whole label has to move, and it lands in front of page i+1's
+    # content rather than matching anything already there. That needs two
+    # different counts: how much of table_last stays behind (none of it, in
+    # that case) vs. how much of table_first is already "the header" that the
+    # moved rows should tuck in after (also none, there).
+    last_skip: int  # leading rows of table_last that stay put on page i
+    first_skip: int  # leading rows of table_first the moved rows are inserted after
 
 
 @dataclass
@@ -121,13 +132,25 @@ def find_table_groups(page: "fitz.Page") -> list:
         if s["text"].strip()
     ]
 
-    def has_text_between(y0: float, y1: float) -> bool:
-        return any(y0 - 0.5 <= (s["bbox"][1] + s["bbox"][3]) / 2 <= y1 + 0.5 for s in spans)
+    def is_dense_flow(y0: float, y1: float) -> bool:
+        """True if the text between y0 and y1 reads as one continuous block —
+        consecutive text-line centers never more than MAX_LINE_GAP apart.
+        False for sparse standalone lines (a heading, blank space, then a
+        signature line) even though there IS text somewhere in the gap."""
+        line_ys = sorted(
+            {
+                round((s["bbox"][1] + s["bbox"][3]) / 2)
+                for s in spans
+                if y0 - 0.5 <= (s["bbox"][1] + s["bbox"][3]) / 2 <= y1 + 0.5
+            }
+        )
+        if not line_ys:
+            return False
+        return all(b - a <= MAX_LINE_GAP for a, b in zip(line_ys, line_ys[1:]))
 
     groups = [[lines[0]]]
     for prev, cur in zip(lines, lines[1:]):
-        gap = cur[0] - prev[0]
-        if gap <= MAX_ROW_GAP and has_text_between(prev[0], cur[0]):
+        if is_dense_flow(prev[0], cur[0]):
             groups[-1].append(cur)
         else:
             groups.append([cur])
@@ -175,6 +198,15 @@ def _matching_header_rows(t_last: TableGroup, t_first: TableGroup) -> int:
     return count
 
 
+def _is_orphaned_label(t: TableGroup) -> bool:
+    """A table that's just a single label row ending in ':' with no body at
+    all — e.g. an "Achievements:" box that ran out of room before any of its
+    content could be drawn. The content shows up on the next page with no
+    repeated label of its own, so there's nothing for _matching_header_rows
+    to match — this is a separate signal."""
+    return len(t.row_texts) == 1 and t.row_texts[0].strip().endswith(":")
+
+
 def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
     """progress_callback(pages_scanned, total_pages), called once per page."""
     candidates = []
@@ -191,16 +223,22 @@ def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
             continue
         t_last = tables_i[-1]
         t_first = tables_i1[0]
-        header_rows = _matching_header_rows(t_last, t_first)
-        if header_rows == 0:
-            continue
+
         if abs(t_last.left - t_first.left) > 5 or abs(t_last.right - t_first.right) > 5:
             continue
         # last table on page i should be the last thing on that page (touching the break)
         page_bottom_content = _content_bottom(doc[i], t_last.bottom)
         if page_bottom_content - t_last.bottom > 20:
             continue
-        candidates.append(SplitCandidate(i, i + 1, t_last, t_first, header_rows))
+
+        header_rows = _matching_header_rows(t_last, t_first)
+        if header_rows > 0:
+            candidates.append(SplitCandidate(i, i + 1, t_last, t_first, header_rows, header_rows))
+        elif _is_orphaned_label(t_last):
+            # Nothing of t_last stays behind (last_skip=0, the whole label
+            # moves) and nothing of t_first is a pre-existing header to tuck
+            # in after (first_skip=0, insert right at its top).
+            candidates.append(SplitCandidate(i, i + 1, t_last, t_first, 0, 0))
     return candidates
 
 
@@ -225,11 +263,12 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     t_last = split.table_last
     t_first = split.table_first
 
-    # bottom of the last shared header row (there can be more than one, e.g. a
-    # title row plus a subtitle row) — computed separately per page since the
-    # two copies' row heights can differ by a hair even when the text matches.
-    header_bottom_i = t_last.boundaries[split.header_rows]
-    header_bottom_i1 = t_first.boundaries[split.header_rows]
+    # Row boundary that everything moves relative to — computed separately
+    # per page since last_skip/first_skip can differ (orphaned-label case)
+    # and even when they're equal, the two copies' row heights can differ by
+    # a hair despite matching text.
+    header_bottom_i = t_last.boundaries[split.last_skip]
+    header_bottom_i1 = t_first.boundaries[split.first_skip]
 
     left = min(t_last.left, t_first.left) - 1
     right = max(t_last.right, t_first.right) + 1
