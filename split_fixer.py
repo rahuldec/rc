@@ -22,7 +22,6 @@ BORDER_MAX_HEIGHT = 2.5
 BORDER_MIN_WIDTH = 15
 Y_BUCKET = 1.0
 SAME_LINE_TOLERANCE = 2.5  # merge border segments this close together into one line
-IMG_DPI = 300
 
 
 @dataclass
@@ -162,8 +161,22 @@ def detect_splits(doc: "fitz.Document") -> list:
     return candidates
 
 
+def _snapshot_page(doc: "fitz.Document", page_index: int) -> "fitz.Document":
+    """An independent single-page copy of doc[page_index], unaffected by later
+    edits to `doc` — lets us clear/rewrite the live page while still being able
+    to pull its original content from the snapshot."""
+    snap = fitz.open()
+    snap.insert_pdf(doc, from_page=page_index, to_page=page_index)
+    return snap
+
+
 def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
-    """Merge one detected split in place. Returns 'fixed' or 'overflow_risk'."""
+    """Merge one detected split in place. Returns 'fixed' or 'overflow_risk'.
+
+    Both moved fragments are re-embedded as vector content (via show_pdf_page
+    from an independent page snapshot), not rasterized — this keeps text
+    selectable/searchable and avoids bloating the file with high-DPI images.
+    """
     page_i = doc[split.page_i]
     page_i1 = doc[split.page_i1]
     t_last = split.table_last
@@ -172,18 +185,19 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     left = min(t_last.left, t_first.left) - 1
     right = max(t_last.right, t_first.right) + 1
 
+    # Snapshot both pages BEFORE any edits — page i+1 needs its own snapshot too
+    # since fragment B's source and target rects are both on page i+1 itself.
+    snap_i = _snapshot_page(doc, split.page_i)
+    snap_i1 = _snapshot_page(doc, split.page_i1)
+
     # Fragment A: the rows on page i that need to move up onto page i+1
     frag_a_rect = fitz.Rect(t_last.left, t_last.header_bottom, t_last.right, t_last.bottom)
     frag_a_height = frag_a_rect.height
-    pix_a = page_i.get_pixmap(clip=frag_a_rect, dpi=IMG_DPI)
-    img_a = pix_a.tobytes("png")
 
     # Fragment B: everything on page i+1 currently below its own header (old body rows + rest of page)
     content_bottom = _content_bottom(page_i1, t_first.header_bottom)
     frag_b_rect = fitz.Rect(t_first.left, t_first.header_bottom, t_first.right, content_bottom + 2)
     frag_b_height = frag_b_rect.height
-    pix_b = page_i1.get_pixmap(clip=frag_b_rect, dpi=IMG_DPI)
-    img_b = pix_b.tobytes("png")
 
     # Clear the moved region on page i (leaves the rest of that page untouched)
     page_i.add_redact_annot(fitz.Rect(left, t_last.top - 1, right, t_last.bottom + 1), fill=(1, 1, 1))
@@ -195,11 +209,18 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
 
     new_a_top = t_first.header_bottom
     new_a_bottom = new_a_top + frag_a_height
-    page_i1.insert_image(fitz.Rect(t_last.left, new_a_top, t_last.right, new_a_bottom), stream=img_a)
+    page_i1.show_pdf_page(
+        fitz.Rect(t_last.left, new_a_top, t_last.right, new_a_bottom), snap_i, 0, clip=frag_a_rect
+    )
 
     new_b_top = new_a_bottom
     new_b_bottom = new_b_top + frag_b_height
-    page_i1.insert_image(fitz.Rect(t_first.left, new_b_top, t_first.right, new_b_bottom), stream=img_b)
+    page_i1.show_pdf_page(
+        fitz.Rect(t_first.left, new_b_top, t_first.right, new_b_bottom), snap_i1, 0, clip=frag_b_rect
+    )
+
+    snap_i.close()
+    snap_i1.close()
 
     safe_bottom = page_i1.rect.height - t_first.top  # mirror the top margin
     if new_b_bottom > safe_bottom:
@@ -207,7 +228,7 @@ def fix_split(doc: "fitz.Document", split: SplitCandidate) -> str:
     return "fixed"
 
 
-def fix_document(doc: "fitz.Document", max_passes: int = 3) -> FixResult:
+def fix_document(doc: "fitz.Document", max_passes: int = 200) -> FixResult:
     result = FixResult()
     for _ in range(max_passes):
         splits = detect_splits(doc)
