@@ -567,6 +567,7 @@ def _compact_student_pages(
         target_page.show_pdf_page(
             fitz.Rect(left, top_margin, right, top_margin + target_h),
             canvas, 0, clip=fitz.Rect(left, y0, right, y1),
+            keep_proportion=False,
         )
 
     canvas.close()
