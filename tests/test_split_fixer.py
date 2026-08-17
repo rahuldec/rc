@@ -1,8 +1,8 @@
 """Regression + edge-case suite for split_fixer.py.
 
 Two kinds of coverage:
-  - Regression tests run against the two real production files that have
-    surfaced every bug fixed so far. They guard against exactly those bugs
+  - Regression tests run against the real production files that have
+    surfaced bugs so far. They guard against exactly those bugs
     reappearing.
   - Edge-case tests build small synthetic PDFs in-memory (via PyMuPDF) to
     exercise each of the three split shapes and the page-count boundary
@@ -20,6 +20,7 @@ import split_fixer
 REAL_FILES = [
     "/Users/rahulsharma/Desktop/6.pdf",
     "/Users/rahulsharma/Desktop/6 satluj.pdf",
+    "/Users/rahulsharma/Downloads/Ganges-fixed.pdf",
 ]
 
 STD_LEFT, STD_RIGHT = 27.75, 566.8
@@ -67,7 +68,7 @@ def _require_file(path):
     return path
 
 
-@pytest.fixture(scope="session", params=REAL_FILES, ids=["6", "6_satluj"])
+@pytest.fixture(scope="session", params=REAL_FILES, ids=["6", "6_satluj", "ganges"])
 def processed_doc(request):
     """Each real file, fully run through fix_document + enforce_page_count
     exactly once for the whole session, plus the raw split/page-count
@@ -139,6 +140,23 @@ def test_western_fusion_table_intact(processed_doc):
         assert "Stage Presence" in doc[i].get_text(), (
             f"page {i} has 'Facial Expressions' but not 'Stage Presence' — "
             "the Western Fusion and Folk Dance table got split across pages again"
+        )
+
+
+def test_social_skills_table_intact(processed_doc):
+    """Guards the text_only content_bottom bug: some source templates draw a
+    row's border but defer its text to the next page, leaving a text-less
+    box behind. _content_bottom() counted that empty box as "more content
+    after this table," pushing detect_splits' page-bottom gap past its
+    threshold and causing the whole split candidate to be silently skipped
+    — even though everything else about it (alignment, matching header)
+    was a valid split."""
+    doc, _, _ = processed_doc
+    pages_with_first_row = [i for i in range(doc.page_count) if "Observes courtesy" in doc[i].get_text()]
+    for i in pages_with_first_row:
+        assert "Follows table etiquettes" in doc[i].get_text(), (
+            f"page {i} has 'Observes courtesy' but not 'Follows table etiquettes' — "
+            "the Social Skills table got split across pages again"
         )
 
 

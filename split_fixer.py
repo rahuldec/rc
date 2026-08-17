@@ -183,18 +183,27 @@ def _in_page_bounds(y0: float, y1: float, page_height: float, tol: float = 3.0) 
     return y0 >= -tol and y1 <= page_height + tol
 
 
-def _content_bottom(page: "fitz.Page", below_y: float) -> float:
-    """Bottom-most extent (y1) of any text/drawing on the page at or below `below_y`."""
+def _content_bottom(page: "fitz.Page", below_y: float, text_only: bool = False) -> float:
+    """Bottom-most extent (y1) of any text/drawing on the page at or below
+    `below_y`. With text_only=True, decorative drawings (borders,
+    background fills) are ignored — used where a bordered-but-empty row
+    shell shouldn't count as "more content after this table" (some source
+    templates draw a row's border but defer its text to the next page,
+    leaving a text-less box behind)."""
     page_h = page.rect.height
     bottom = below_y
     for b in page.get_text("dict")["blocks"]:
         bbox = b.get("bbox", (0, 0, 0, 0))
+        text = "".join(s["text"] for l in b.get("lines", []) for s in l.get("spans", []))
+        if not text.strip():
+            continue
         if bbox[1] >= below_y - 1 and _in_page_bounds(bbox[1], bbox[3], page_h):
             bottom = max(bottom, bbox[3])
-    for dr in page.get_drawings():
-        r = dr["rect"]
-        if r.y0 >= below_y - 1 and _in_page_bounds(r.y0, r.y1, page_h):
-            bottom = max(bottom, r.y1)
+    if not text_only:
+        for dr in page.get_drawings():
+            r = dr["rect"]
+            if r.y0 >= below_y - 1 and _in_page_bounds(r.y0, r.y1, page_h):
+                bottom = max(bottom, r.y1)
     return bottom
 
 
@@ -240,7 +249,7 @@ def detect_splits(doc: "fitz.Document", progress_callback=None) -> list:
         if abs(t_last.left - t_first.left) > 5 or abs(t_last.right - t_first.right) > 5:
             continue
         # last table on page i should be the last thing on that page (touching the break)
-        page_bottom_content = _content_bottom(doc[i], t_last.bottom)
+        page_bottom_content = _content_bottom(doc[i], t_last.bottom, text_only=True)
         if page_bottom_content - t_last.bottom > 20:
             continue
 
