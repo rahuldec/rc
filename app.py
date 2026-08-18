@@ -56,12 +56,6 @@ def _process_job(job_id: str, pdf_bytes: bytes, out_name: str) -> None:
 
     try:
         result = split_fixer.fix_document(doc, progress_callback=progress)
-
-        def compact_progress(current, total):
-            progress("compact", current, total)
-
-        page_result = split_fixer.enforce_page_count(doc, progress_callback=compact_progress)
-
         out_buf = io.BytesIO()
         doc.save(out_buf)
         doc.close()
@@ -78,8 +72,6 @@ def _process_job(job_id: str, pdf_bytes: bytes, out_name: str) -> None:
             out_name=out_name,
             splits_fixed=result.splits_fixed,
             overflow_risk=bool(result.overflow_risk_pages),
-            students_compacted=page_result.students_compacted,
-            students_flagged=page_result.students_flagged,
         )
 
 
@@ -206,8 +198,7 @@ function setProgress(phase, current, total) {
   if (!total) {
     progressFill.classList.add('indeterminate');
     progressFill.style.width = '';
-    progressText.textContent = phase === 'fix' ? 'Merging tables…'
-      : phase === 'compact' ? 'Checking page counts…' : 'Reading pages…';
+    progressText.textContent = phase === 'fix' ? 'Merging tables…' : 'Reading pages…';
     progressPct.textContent = '';
     return;
   }
@@ -216,8 +207,6 @@ function setProgress(phase, current, total) {
   progressFill.style.width = pct + '%';
   progressText.textContent = phase === 'fix'
     ? `Merging table ${current} of ${total}`
-    : phase === 'compact'
-    ? `Checking student ${current} of ${total}`
     : `Reading page ${current} of ${total}`;
   progressPct.textContent = pct + '%';
 }
@@ -255,20 +244,12 @@ async function poll(jobId) {
 
       window.location.href = '/download/' + jobId;
 
-      const bits = [];
-      if (j.splits_fixed > 0) bits.push(`fixed ${j.splits_fixed} split table(s)`);
-      if (j.students_compacted > 0) bits.push(`compacted ${j.students_compacted} report(s) to the right page count`);
-      const summary = bits.length ? bits.join(', ') + '.' : 'No split tables or page-count issues found — downloaded a copy unchanged.';
-
-      if (j.students_flagged && j.students_flagged.length) {
-        const list = j.students_flagged.map(f => `page ${f.start_page} (${f.reason})`).join(', ');
-        showStatus('warn', `${summary} Could not auto-fix ${j.students_flagged.length} report(s), please check manually: ${list}.`);
+      if (j.splits_fixed === 0) {
+        showStatus('warn', 'No split table found — downloaded a copy unchanged, nothing to fix.');
       } else if (j.overflow_risk) {
-        showStatus('warn', `${summary} One page may still run long — please spot-check it.`);
-      } else if (bits.length) {
-        showStatus('ok', `${summary} Download started.`);
+        showStatus('warn', `Fixed ${j.splits_fixed} split table(s), but the result may run long on one page — please spot-check it.`);
       } else {
-        showStatus('warn', summary);
+        showStatus('ok', `Fixed ${j.splits_fixed} split table(s). Download started.`);
       }
       goBtn.disabled = false;
     }
@@ -340,8 +321,6 @@ def start():
             "out_name": out_name,
             "splits_fixed": 0,
             "overflow_risk": False,
-            "students_compacted": 0,
-            "students_flagged": [],
         }
 
     threading.Thread(target=_process_job, args=(job_id, pdf_bytes, out_name), daemon=True).start()
@@ -362,8 +341,6 @@ def progress_endpoint(job_id):
             "error": job["error"],
             "splits_fixed": job["splits_fixed"],
             "overflow_risk": job["overflow_risk"],
-            "students_compacted": job["students_compacted"],
-            "students_flagged": job["students_flagged"],
         }
 
 
